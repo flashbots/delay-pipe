@@ -8,7 +8,7 @@ use std::{
 };
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, sync::mpsc, time::Instant};
 
-const MAX_ENTRIES: usize = 10_000_000;
+const MAX_BUF_BYTES: usize = 1 << 30; // 1 GiB
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,8 +39,8 @@ async fn main() -> anyhow::Result<()> {
     )?;
     watcher.watch(&src, RecursiveMode::NonRecursive)?;
 
-    // Statically allocate 10M entries to avoid reallocations
-    let mut buf: VecDeque<(Instant, String)> = VecDeque::with_capacity(MAX_ENTRIES);
+    let mut buf: VecDeque<(Instant, String)> = VecDeque::new();
+    let mut buf_bytes = 0usize;
     let mut rdr = BufReader::new(src_file);
     rdr.seek(SeekFrom::End(0))?;
 
@@ -53,10 +53,12 @@ async fn main() -> anyhow::Result<()> {
                 if matches!(event.kind, EventKind::Modify(_)) {
                     let mut line = String::new();
                     while rdr.read_line(&mut line)? > 0 {
-                        if buf.len() >= MAX_ENTRIES {
-                            buf.pop_front();
+                        if buf_bytes + line.len() <= MAX_BUF_BYTES {
+                            buf_bytes += line.len();
+                            buf.push_back((Instant::now() + delay, std::mem::take(&mut line)));
+                        } else {
+                            line.clear();
                         }
-                        buf.push_back((Instant::now() + delay, std::mem::take(&mut line)));
                     }
                 }
             }
@@ -74,7 +76,9 @@ async fn main() -> anyhow::Result<()> {
                     .open(&dst)
                     .await?;
                 while buf.front().is_some_and(|(t, _)| *t <= now) {
-                    out.write_all(buf.pop_front().unwrap().1.as_bytes()).await?;
+                    let (_, s) = buf.pop_front().unwrap();
+                    buf_bytes -= s.len();
+                    out.write_all(s.as_bytes()).await?;
                 }
                 out.sync_data().await?;
             }
