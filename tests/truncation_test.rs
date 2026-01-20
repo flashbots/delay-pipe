@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Child};
 use std::thread;
 use std::time::Duration;
@@ -11,52 +11,61 @@ fn start(src: &std::path::Path, dst: &std::path::Path, delay_secs: u64) -> Child
         .spawn().unwrap()
 }
 
-#[test]
-fn test_truncation_handling() {
+fn setup() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     let dir = TempDir::new().unwrap();
-    let src = dir.path().join("source.log");
-    let dst = dir.path().join("dest.log");
+    let (src, dst) = (dir.path().join("src.log"), dir.path().join("dst.log"));
+    File::create(&src).unwrap();
+    (dir, src, dst)
+}
+
+fn read_lines(path: &std::path::Path) -> Vec<String> {
+    if !path.exists() { return vec![]; }
+    BufReader::new(File::open(path).unwrap()).lines().map_while(Result::ok).collect()
+}
+
+fn sleep(ms: u64) { thread::sleep(Duration::from_millis(ms)); }
+
+#[test]
+fn handles_copytruncate() {
+    let (_dir, src, dst) = setup();
     
-    // Create initial file with content
-    let mut file = File::create(&src).unwrap();
+    // Write initial content to get file to a reasonable size
+    let mut f = OpenOptions::new().append(true).open(&src).unwrap();
     for i in 0..10 {
-        writeln!(file, "Initial line {}", i).unwrap();
+        writeln!(f, "Initial line {}", i).unwrap();
     }
-    file.sync_all().unwrap();
-    drop(file);
+    f.flush().unwrap();
     
     // Start delay-pipe with 1 second delay
     let mut child = start(&src, &dst, 1);
-    thread::sleep(Duration::from_millis(500));
+    sleep(200);
     
-    // Append more lines
-    let mut file = OpenOptions::new().append(true).open(&src).unwrap();
-    writeln!(file, "Before truncate").unwrap();
-    file.sync_all().unwrap();
-    drop(file);
+    // Write a marker line before truncation
+    writeln!(f, "Before truncate").unwrap();
+    f.flush().unwrap();
+    drop(f);
     
-    thread::sleep(Duration::from_millis(500));
+    sleep(200);
     
-    // Simulate copytruncate: copy the file then truncate
+    // Simulate logrotate copytruncate
     std::fs::copy(&src, src.with_extension("1")).unwrap();
-    File::create(&src).unwrap(); // Truncates the file
+    File::create(&src).unwrap(); // Truncates to 0
     
     // Write new content after truncation
-    let mut file = OpenOptions::new().append(true).open(&src).unwrap();
-    writeln!(file, "After truncate line 1").unwrap();
-    writeln!(file, "After truncate line 2").unwrap();
-    file.sync_all().unwrap();
-    drop(file);
+    let mut f = OpenOptions::new().append(true).open(&src).unwrap();
+    writeln!(f, "After truncate line 1").unwrap();
+    writeln!(f, "After truncate line 2").unwrap();
+    f.flush().unwrap();
     
     // Wait for delay to pass
-    thread::sleep(Duration::from_secs(2));
+    sleep(1500);
     
-    // Check that the post-truncation lines appear in destination
-    let content = std::fs::read_to_string(&dst).unwrap();
-    assert!(content.contains("After truncate line 1"), 
-            "Destination should contain post-truncation content, but got: {}", content);
-    assert!(content.contains("After truncate line 2"), 
-            "Destination should contain post-truncation content, but got: {}", content);
+    // Verify post-truncation lines appear in output
+    let lines = read_lines(&dst);
+    assert!(lines.iter().any(|l| l.contains("After truncate line 1")), 
+            "Missing post-truncation content. Got: {:?}", lines);
+    assert!(lines.iter().any(|l| l.contains("After truncate line 2")), 
+            "Missing post-truncation content. Got: {:?}", lines);
     
     child.kill().unwrap();
 }
