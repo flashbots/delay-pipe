@@ -2,6 +2,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
     collections::VecDeque,
     env,
+    fs,
     io::{BufRead, BufReader, Seek, SeekFrom},
     os::unix::fs::OpenOptionsExt,
     path::PathBuf,
@@ -51,6 +52,16 @@ async fn main() -> anyhow::Result<()> {
             Some(event) = rx.recv() => {
                 // File was changed
                 if matches!(event.kind, EventKind::Modify(_)) {
+                    // Check if file was truncated (copytruncate scenario)
+                    let current_pos = rdr.stream_position()?;
+                    let file_size = fs::metadata(&src)?.len();
+                    
+                    if file_size < current_pos {
+                        // File was truncated, reset to beginning
+                        eprintln!("File truncation detected (size {} < position {}), resetting reader", file_size, current_pos);
+                        rdr.seek(SeekFrom::Start(0))?;
+                    }
+                    
                     let mut line = String::new();
                     while rdr.read_line(&mut line)? > 0 {
                         if buf_bytes + line.len() <= MAX_BUF_BYTES {
